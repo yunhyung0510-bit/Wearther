@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI CLOSET · 여행 코디 플래너</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#FAFAF7;color:#17181A;font-family:'Noto Sans KR',sans-serif}
+.page{min-height:100vh;padding:36px 16px}.wrap{max-width:640px;margin:auto}
+header{margin-bottom:32px}.eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.08em;color:#3C5A48;margin-bottom:10px}
+h1{font-size:clamp(22px,4vw,28px);margin:0 0 8px;line-height:1.4}header p{font-size:13.5px;color:#9A9A90;margin:0;line-height:1.6;max-width:480px}
+.block{padding:26px 0;border-top:1px solid #E6E4DC}.head{display:flex;gap:8px;align-items:baseline;margin-bottom:16px}.step{font:11px 'IBM Plex Mono';color:#9A9A90}.bt{font-size:15px;font-weight:700}
+.searchrow{display:flex;gap:8px;margin-bottom:10px}.inputwrap{display:flex;align-items:center;gap:8px;background:white;border:1px solid #E6E4DC;border-radius:8px;padding:9px 12px;flex:1}
+input{border:0;outline:0;background:transparent;font:13.5px 'Noto Sans KR';color:#17181A;width:100%}input:focus{outline:2px solid #3C5A48;outline-offset:1px}
+button{font-family:inherit}.small{border:1px solid #E6E4DC;background:white;border-radius:8px;padding:0 16px;font-size:13px;cursor:pointer}
+#map{width:100%;height:300px;border-radius:10px;overflow:hidden;border:1px solid #E6E4DC;background:#EFEEE8}.hint,.note,.disclaimer{font-size:11.5px;color:#9A9A90;line-height:1.6}.chip{display:inline-flex;gap:6px;margin-top:10px;background:#EEF2ED;color:#3C5A48;border-radius:999px;padding:5px 12px;font-size:12.5px}
+.row2{display:flex;gap:12px}.field{flex:1}.label{display:block;font-size:11.5px;color:#9A9A90;margin-bottom:6px}
+.presets{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}.preset{border:1px solid #E6E4DC;background:white;color:#9A9A90;border-radius:999px;padding:5px 13px;font-size:12px;cursor:pointer}.preset.active{border-color:#3C5A48;background:#EEF2ED;color:#3C5A48}
+.primary{margin-top:20px;width:100%;background:#17181A;color:white;border:0;border-radius:8px;padding:13px 16px;font-size:14px;font-weight:700;cursor:pointer}.primary:disabled{opacity:.6;cursor:wait}
+.day{display:grid;grid-template-columns:78px 92px 1fr;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #E6E4DC}.date,.mono{font-family:'IBM Plex Mono',monospace;font-size:12px}.weather{display:flex;gap:5px;align-items:center}.badge{font-size:9.5px;color:#9A9A90;border:1px solid #E6E4DC;border-radius:4px;padding:1px 4px}.outfit{font-size:12.5px}
+.shop{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-bottom:1px solid #E6E4DC;text-decoration:none;color:#17181A}.cat{font-size:10.5px;color:#3C5A48;background:#EEF2ED;border-radius:4px;padding:2px 6px}.name{font-size:14px;font-weight:500;margin-top:5px}.right{text-align:right}.link{font-size:11.5px;color:#9A9A90;margin-top:4px}.intro{font-size:12.5px;color:#9A9A90;line-height:1.6;margin-bottom:14px}
+.error{color:#B6493D}.loading{padding:18px;text-align:center;color:#9A9A90}
+@media(max-width:560px){.day{grid-template-columns:70px 85px 1fr;gap:7px}.outfit{font-size:11.5px}.row2{flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="page"><div class="wrap">
+<header>
+<div class="eyebrow">AI CLOSET · 여행 코디 플래너</div>
+<h1>지도를 찍고, 날짜와 예산을 정하면</h1>
+<p>출국부터 입국까지, 날마다 입을 옷을 날씨에 맞춰 추천하고 무신사에서 바로 찾아드려요.</p>
+</header>
+
+<section class="block">
+<div class="head"><span class="step">01</span><span class="bt">여행지 선택</span></div>
+<div class="searchrow">
+<div class="inputwrap">⌕<input id="query" placeholder="지도에서 찾기 (예: 후쿠오카, Lisbon)"></div>
+<button class="small" id="searchBtn">이동</button>
+</div>
+<div id="map"></div>
+<p class="hint">지도를 클릭하면 그 자리에 핀이 꽂혀요.</p>
+<div id="place"></div>
+<div id="mapError" class="note error"></div>
+</section>
+
+<section class="block">
+<div class="head"><span class="step">02</span><span class="bt">일정 · 예산</span></div>
+<div class="row2">
+<div class="field"><label class="label">출국일</label><div class="inputwrap"><input id="depart" type="date"></div></div>
+<div class="field"><label class="label">입국일</label><div class="inputwrap"><input id="ret" type="date"></div></div>
+</div>
+<div class="field" style="margin-top:16px"><label class="label">옷 구매 예산</label>
+<div class="inputwrap">₩<input id="budget" type="number" min="0" step="10000"><span style="font-size:12.5px;color:#9A9A90">원</span></div></div>
+<div class="presets">
+<button class="preset" data-budget="100000">10만</button><button class="preset" data-budget="200000">20만</button><button class="preset active" data-budget="300000">30만</button><button class="preset" data-budget="500000">50만</button>
+</div>
+<button class="primary" id="planBtn">코디 플랜 만들기</button>
+<div id="planError" class="note error"></div>
+</section>
+
+<div id="results"></div>
+</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const rules=[
+{min:28,outer:"없음",top:"반팔 티셔츠",bottom:"린넨 반바지",shoes:"샌들"},
+{min:23,outer:"얇은 셔츠",top:"반팔 · 얇은 셔츠",bottom:"면바지",shoes:"스니커즈"},
+{min:20,outer:"가디건",top:"긴팔 셔츠",bottom:"청바지",shoes:"스니커즈"},
+{min:17,outer:"자켓",top:"니트",bottom:"청바지",shoes:"스니커즈"},
+{min:12,outer:"트렌치코트",top:"기모 맨투맨",bottom:"두꺼운 팬츠",shoes:"부츠"},
+{min:9,outer:"울 코트",top:"니트",bottom:"기모 바지",shoes:"부츠"},
+{min:5,outer:"두꺼운 코트",top:"기모 후드",bottom:"두꺼운 청바지",shoes:"방한 부츠"},
+{min:-99,outer:"롱패딩",top:"기모 니트",bottom:"기모 안감 팬츠",shoes:"털 부츠"}];
+const weights={outer:.35,top:.2,bottom:.25,shoes:.2};
+const cat={outer:"아우터",top:"상의",bottom:"하의",shoes:"신발"};
+const $=id=>document.getElementById(id);
+const pad=n=>String(n).padStart(2,"0");
+const iso=d=>d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+const add=(d,n)=>{let x=new Date(d);x.setDate(x.getDate()+n);return x};
+const fmt=d=>`${d.getMonth()+1}.${d.getDate()} (${"일월화수목금토"[d.getDay()]})`;
+const won=n=>Math.round(n).toLocaleString("ko-KR")+"원";
+const today=new Date();today.setHours(0,0,0,0);
+$("depart").value=iso(add(today,5));$("depart").min=iso(today);
+$("ret").value=iso(add(today,8));$("ret").min=$("depart").value;
+$("budget").value=300000;
+$("depart").onchange=()=>{$("ret").min=$("depart").value;if($("ret").value<$("depart").value)$("ret").value=$("depart").value};
+document.querySelectorAll(".preset").forEach(b=>b.onclick=()=>{ $("budget").value=b.dataset.budget;document.querySelectorAll(".preset").forEach(x=>x.classList.remove("active"));b.classList.add("active")});
+
+let map=L.map("map").setView([20,20],2);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap",maxZoom:18}).addTo(map);
+let marker=null,pin=null,placeName="";
+const pinIcon=L.divIcon({html:'<div style="width:22px;height:22px;background:#3C5A48;border:4px solid #FAFAF7;border-radius:50%;box-shadow:0 1px 4px #555"></div>',className:"",iconSize:[22,22],iconAnchor:[11,11]});
+
+async function reverse(lat,lon){
+ try{
+  const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&accept-language=ko`);
+  const d=await r.json(),a=d.address||{},city=a.city||a.town||a.village||a.county||a.state||"",country=a.country||"";
+  placeName=[city,country].filter(Boolean).join(", ")||d.display_name||`${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+ }catch{placeName=`${lat.toFixed(2)}, ${lon.toFixed(2)}`}
+ $("place").innerHTML=`<span class="chip">📍 ${placeName}</span>`;
+}
+async function setPin(lat,lon){
+ pin={lat,lon}; if(marker)marker.setLatLng([lat,lon]);else marker=L.marker([lat,lon],{icon:pinIcon}).addTo(map);
+ await reverse(lat,lon);
+}
+map.on("click",e=>setPin(e.latlng.lat,e.latlng.lng));
+async function search(){
+ $("mapError").textContent="";
+ const q=$("query").value.trim();if(!q)return;
+ try{
+  const r=await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=1&accept-language=ko`);
+  const d=await r.json();if(!d.length){$("mapError").textContent=`"${q}"를 찾지 못했어요.`;return}
+  const lat=+d[0].lat,lon=+d[0].lon;map.setView([lat,lon],10);await setPin(lat,lon);
+ }catch{$("mapError").textContent="검색에 실패했어요. 잠시 후 다시 시도해주세요."}
+}
+$("searchBtn").onclick=search;$("query").onkeydown=e=>{if(e.key==="Enter")search()};
+
+function tier(t){return rules.find(x=>t>=x.min)||rules[rules.length-1]}
+async function weather(lat,lon,start,end){
+ const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_min,temperature_2m_max,precipitation_probability_max,weather_code&timezone=auto&start_date=${start}&end_date=${end}`;
+ const r=await fetch(url);if(!r.ok)throw Error();
+ return r.json();
+}
+function condition(code){
+ if([71,73,75,77,85,86].includes(code))return "눈";
+ if([95,96,99].includes(code))return "뇌우";
+ if([51,53,55,56,57,61,63,65,66,67,80,81,82].includes(code))return "비";
+ if([45,48].includes(code))return "안개";
+ if([1,2].includes(code))return "구름조금";
+ if(code===3)return "흐림";return "맑음";
+}
+function icon(c){return {맑음:"☀️",구름조금:"⛅",흐림:"☁️",비:"🌧️",눈:"❄️",뇌우:"⛈️",안개:"🌫️"}[c]||"☁️"}
+
+$("planBtn").onclick=async()=>{
+ $("planError").textContent="";$("results").innerHTML="";
+ if(!pin){$("planError").textContent="지도에서 여행지를 먼저 찍어주세요.";return}
+ const s=new Date($("depart").value+"T00:00:00"),e=new Date($("ret").value+"T00:00:00");
+ const len=Math.round((e-s)/86400000)+1;
+ if(len<1){$("planError").textContent="입국일은 출국일보다 늦어야 해요.";return}
+ if(len>16){$("planError").textContent="Open-Meteo의 무료 예보 범위에 맞춰 최대 16일까지 지원해요.";return}
+ $("planBtn").disabled=true;$("planBtn").textContent="날씨 분석 중…";
+ try{
+  const w=await weather(pin.lat,pin.lon,iso(s),iso(e));
+  const days=w.daily.time.map((ds,i)=>{
+   const mn=w.daily.temperature_2m_min[i],mx=w.daily.temperature_2m_max[i],avg=(mn+mx)/2;
+   return {date:new Date(ds+"T00:00:00"),mn,mx,p:w.daily.precipitation_probability_max?.[i],c:condition(w.daily.weather_code[i]),t:tier(avg)}
+  });
+  const list=[];const sets={outer:new Set(),top:new Set(),bottom:new Set(),shoes:new Set()};
+  days.forEach(d=>Object.keys(sets).forEach(k=>{if(d.t[k]&&d.t[k]!=="없음")sets[k].add(d.t[k])}));
+  Object.keys(sets).forEach(k=>{let names=[...sets[k]],each=(+$("budget").value||0)*weights[k]/Math.max(1,names.length);names.forEach(n=>list.push({k,n,b:each}))});
+  list.sort((a,b)=>b.b-a.b);
+  const total=list.reduce((a,x)=>a+x.b,0);
+  $("results").innerHTML=`
+  <section class="block"><div class="head"><span class="step">03</span><span class="bt">날짜별 코디</span></div>
+  <div>${days.map((d,i)=>`<div class="day"><div class="date">${i===0?"✈ ":""}${fmt(d.date)}</div><div class="weather"><span>${icon(d.c)}</span><span class="mono">${Math.round(d.mn)}° / ${Math.round(d.mx)}°</span></div><div class="outfit">${[d.t.outer,d.t.top,d.t.bottom,d.t.shoes].filter(x=>x&&x!=="없음").join(" · ")}</div></div>`).join("")}</div>
+  <p class="disclaimer">날씨는 Open-Meteo의 실시간 예보를 사용한 참고값이에요. 출발 전 최신 예보를 다시 확인해주세요.</p></section>
+  <section class="block"><div class="head"><span class="step">04</span><span class="bt">쇼핑 리스트</span></div>
+  <p class="intro">여행 기간 동안 겹치는 옷은 한 벌씩만 계산했어요. 예산 ${won(+$("budget").value)} 중 약 ${won(total)}을 배분했어요.</p>
+  <div>${list.map(x=>`<a class="shop" href="https://www.musinsa.com/search/goods?keyword=${encodeURIComponent(x.n)}" target="_blank" rel="noopener noreferrer"><div><span class="cat">${cat[x.k]}</span><div class="name">${x.n}</div></div><div class="right"><div class="mono">${won(x.b)}</div><div class="link">무신사에서 보기 ↗</div></div></a>`).join("")}</div>
+  <p class="disclaimer">표시된 금액은 예산을 항목별로 나눈 참고 값이에요. 실제 상품 가격은 무신사 검색 결과에서 확인해주세요.</p></section>`;
+ }catch{$("planError").textContent="날씨 정보를 가져오지 못했어요. 인터넷 연결을 확인하고 다시 시도해주세요."}
+ finally{$("planBtn").disabled=false;$("planBtn").textContent="코디 플랜 만들기"}
+};
+</script>
+</body></html>
