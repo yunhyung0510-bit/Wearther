@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI CLOSET · 여행 코디 플래너</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box} body{margin:0}
+
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+.spin { animation: spin .9s linear infinite; }
+@keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+.leaflet-container { font-family: inherit; }
+.ac-pin { background: transparent; border: none; }
+input:focus { outline: 2px solid #3C5A48; outline-offset: 1px; }
+input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
+a { text-decoration: none; }
+
+body{background:#FAFAF7}
+button:disabled{opacity:.55;cursor:not-allowed}
+.row2>div{flex:1}
+@media(max-width:560px){
+ .dayRow{grid-template-columns:70px 90px 1fr!important;gap:6px!important}
+ .dayOutfit{font-size:11.5px!important}
+ .row2{flex-direction:column}
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const C={bg:"#FAFAF7",card:"#FFFFFF",border:"#E6E4DC",ink:"#17181A",faint:"#9A9A90",accent:"#3C5A48",accentSoft:"#EEF2ED",errorText:"#B6493D"};
+const OUTFIT_RULES=[
+ {min:28,outer:"없음",top:"반팔 티셔츠",bottom:"린넨 반바지",shoes:"샌들"},
+ {min:23,outer:"얇은 셔츠",top:"반팔 · 얇은 셔츠",bottom:"면바지",shoes:"스니커즈"},
+ {min:20,outer:"가디건",top:"긴팔 셔츠",bottom:"청바지",shoes:"스니커즈"},
+ {min:17,outer:"자켓",top:"니트",bottom:"청바지",shoes:"스니커즈"},
+ {min:12,outer:"트렌치코트",top:"기모 맨투맨",bottom:"두꺼운 팬츠",shoes:"부츠"},
+ {min:9,outer:"울 코트",top:"니트",bottom:"기모 바지",shoes:"부츠"},
+ {min:5,outer:"두꺼운 코트",top:"기모 후드",bottom:"두꺼운 청바지",shoes:"방한 부츠"},
+ {min:-99,outer:"롱패딩",top:"기모 니트",bottom:"기모 안감 팬츠",shoes:"털 부츠"}
+];
+const CATEGORY_WEIGHT={아우터:.35,상의:.2,하의:.25,신발:.2};
+const CATEGORY_KEY={outer:"아우터",top:"상의",bottom:"하의",shoes:"신발"};
+const CONDITION_ICON={맑음:"☀️",구름조금:"☁️",흐림:"☁️",비:"🌧️",눈:"❄️",뇌우:"⛈️",안개:"🌫️"};
+const pickTier=t=>OUTFIT_RULES.find(r=>t>=r.min)||OUTFIT_RULES.at(-1);
+const iso=d=>d.toISOString().slice(0,10);
+const today=()=>{let d=new Date();d.setHours(0,0,0,0);return d};
+const addDays=(d,n)=>{let c=new Date(d);c.setDate(c.getDate()+n);return c};
+const dayDiff=(a,b)=>Math.round((b-a)/86400000);
+const fmtKo=d=>`${d.getMonth()+1}.${d.getDate()} (${"일월화수목금토"[d.getDay()]})`;
+const fmtWon=n=>`${Math.round(n).toLocaleString("ko-KR")}원`;
+const musinsaLink=k=>`https://www.musinsa.com/search/goods?keyword=${encodeURIComponent(k)}`;
+
+let state={
+ pin:null,placeName:"",marker:null,map:null,mapQuery:"",
+ depart:iso(addDays(today(),5)),ret:iso(addDays(today(),8)),budget:300000,
+ days:null,shoppingList:null,loading:false,status:"",error:"",searchError:""
+};
+
+function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+function render(){
+ const app=document.getElementById("app");
+ app.innerHTML=`<div style="min-height:100vh;background:${C.bg};color:${C.ink};font-family:'Noto Sans KR',-apple-system,sans-serif;padding:36px 16px">
+ <div style="max-width:640px;margin:0 auto">
+  <header style="margin-bottom:32px"><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.08em;color:${C.accent};margin-bottom:10px">AI CLOSET · 여행 코디 플래너</div>
+  <h1 style="font-size:clamp(22px,4vw,28px);font-weight:700;margin:0 0 8px;line-height:1.4">지도를 찍고, 날짜와 예산을 정하면</h1>
+  <p style="font-size:13.5px;color:${C.faint};margin:0;line-height:1.6;max-width:480px">출국부터 입국까지, 날마다 입을 옷을 날씨에 맞춰 추천하고 무신사에서 바로 찾아드려요.</p></header>
+  ${mapSection()}${scheduleSection()}${state.days?resultSection():""}
+ </div></div>`;
+ bind();
+}
+function block(title,n,body){return `<section style="padding:26px 0;border-top:1px solid ${C.border}"><div style="display:flex;align-items:baseline;gap:8px;margin-bottom:16px"><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:${C.faint}">${n}</span><span style="font-size:15px;font-weight:700">${title}</span></div>${body}</section>`}
+function mapSection(){
+ return block("여행지 선택","01",`
+ <div style="display:flex;gap:8px;margin-bottom:10px"><div style="display:flex;align-items:center;gap:8px;background:#fff;border:1px solid ${C.border};border-radius:8px;padding:9px 12px;flex:1"><span>⌕</span><input id="mapQuery" style="border:0;outline:0;background:transparent;font-size:13.5px;font-family:inherit;color:${C.ink};width:100%" placeholder="지도에서 찾기 (예: 후쿠오카, Lisbon)" value="${esc(state.mapQuery)}"></div><button id="searchBtn" style="border:1px solid ${C.border};background:#fff;border-radius:8px;padding:0 16px;font-size:13px;cursor:pointer;color:${C.ink}">이동</button></div>
+ ${state.searchError?note(state.searchError,true):""}
+ <div id="map" style="width:100%;height:300px;border-radius:10px;overflow:hidden;border:1px solid ${C.border};position:relative;background:#EFEEE8"></div>
+ <p style="font-size:11.5px;color:${C.faint};margin-top:8px">지도를 클릭하면 그 자리에 핀이 꽂혀요.</p>
+ ${state.pin?`<div style="margin-top:10px;display:inline-flex;align-items:center;gap:6px;font-size:12.5px;background:${C.accentSoft};color:${C.accent};border-radius:999px;padding:5px 12px">📍 ${esc(state.placeName||"위치 확인 중…")}</div>`:""}`);
+}
+function note(t,err=false){return `<div style="display:flex;align-items:flex-start;gap:6px;font-size:12.5px;margin-top:10px;line-height:1.5;color:${err?C.errorText:C.faint}">⚠ <span>${esc(t)}</span></div>`}
+function scheduleSection(){
+ return block("일정 · 예산","02",`
+ <div class="row2" style="display:flex;gap:12px"><div><label style="display:block;font-size:11.5px;color:${C.faint};margin-bottom:6px">출국일</label><input id="depart" type="date" style="width:100%;border:1px solid ${C.border};border-radius:8px;padding:9px 12px;font-size:13.5px" value="${state.depart}" min="${iso(today())}"></div>
+ <div><label style="display:block;font-size:11.5px;color:${C.faint};margin-bottom:6px">입국일</label><input id="ret" type="date" style="width:100%;border:1px solid ${C.border};border-radius:8px;padding:9px 12px;font-size:13.5px" value="${state.ret}" min="${state.depart}"></div></div>
+ <div style="margin-top:16px"><label style="display:block;font-size:11.5px;color:${C.faint};margin-bottom:6px">옷 구매 예산</label><div style="display:flex;align-items:center;gap:8px;background:#fff;border:1px solid ${C.border};border-radius:8px;padding:9px 12px"><span>₩</span><input id="budget" type="number" min="0" step="10000" style="border:0;outline:0;background:transparent;font-size:13.5px;width:100%" value="${state.budget}"><span style="font-size:12.5px;color:${C.faint}">원</span></div></div>
+ <div style="display:flex;gap:8px;margin-top:8px">${[100000,200000,300000,500000].map(v=>`<button class="preset" data-v="${v}" style="border:1px solid ${state.budget===v?C.accent:C.border};background:${state.budget===v?C.accentSoft:C.card};color:${state.budget===v?C.accent:C.faint};border-radius:999px;padding:5px 13px;font-size:12px;cursor:pointer">${v/10000}만</button>`).join("")}</div>
+ <button id="planBtn" ${state.loading?"disabled":""} style="margin-top:20px;width:100%;background:${C.ink};color:#fff;border:0;border-radius:8px;padding:13px 16px;font-size:14px;font-weight:700;cursor:pointer">${state.loading?"⟳ "+esc(state.status||"날씨 분석 중…"):"코디 플랜 만들기"}</button>
+ ${state.error?note(state.error,true):""}`);
+}
+function resultSection(){
+ const total=state.shoppingList.reduce((s,i)=>s+i.budget,0);
+ return block("날짜별 코디","03",`<div>${state.days.map((d,i)=>`<div class="dayRow" style="display:grid;grid-template-columns:78px 92px 1fr;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid ${C.border}"><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px">${i===0?"✈ ":""}${fmtKo(d.date)}</div><div style="display:flex;align-items:center;gap:5px">${CONDITION_ICON[d.c]||"☁️"} <span style="font-family:'IBM Plex Mono',monospace;font-size:12px">${Math.round(d.mn)}° / ${Math.round(d.mx)}°</span>${d.estimate?`<span style="font-size:9.5px;color:${C.faint};border:1px solid ${C.border};border-radius:4px;padding:1px 4px">평년</span>`:""}</div><div style="font-size:12.5px">${[d.tier.outer,d.tier.top,d.tier.bottom,d.tier.shoes].filter(v=>v&&v!=="없음").join(" · ")}</div></div>`).join("")}</div><p style="display:flex;gap:6px;font-size:11px;color:${C.faint};margin-top:14px;line-height:1.6">날씨는 웹 날씨 API의 참고값이에요. 출발 전 최신 예보를 다시 확인해주세요.</p>`)
+ + block("쇼핑 리스트","04",`<p style="font-size:12.5px;color:${C.faint};line-height:1.6;margin-bottom:14px">여행 기간 동안 겹치는 옷은 한 벌씩만 계산했어요. 예산 ${fmtWon(state.budget)} 중 약 ${fmtWon(total)}을 배분했어요.</p>
+ <div>${state.shoppingList.map(item=>`<a href="${musinsaLink(item.name)}" target="_blank" rel="noopener noreferrer" style="display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-bottom:1px solid ${C.border};text-decoration:none"><div><span style="font-size:10.5px;color:${C.accent};background:${C.accentSoft};border-radius:4px;padding:2px 6px">${item.category}</span><div style="font-size:14px;font-weight:500;margin-top:5px;color:${C.ink}">${esc(item.name)}</div></div><div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px"><span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:${C.ink}">${fmtWon(item.budget)}</span><span style="font-size:11.5px;color:${C.faint}">무신사에서 보기 ↗</span></div></a>`).join("")}</div>
+ <p style="display:flex;gap:6px;font-size:11px;color:${C.faint};margin-top:14px;line-height:1.6">🛍 표시된 금액은 예산을 항목별로 나눈 참고 값이에요. 실제 상품 가격은 무신사 검색 결과에서 확인해주세요.</p>`);
+}
+function bind(){
+ const mapEl=document.getElementById("map");
+ if(mapEl){
+  state.map=L.map(mapEl,{zoomControl:true}).setView(state.pin?[state.pin.lat,state.pin.lon]:[20,20],state.pin?10:2);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"&copy; OpenStreetMap",maxZoom:18}).addTo(state.map);
+  state.map.on("click",e=>handlePin(e.latlng.lat,e.latlng.lng));
+  if(state.pin){state.marker=L.marker([state.pin.lat,state.pin.lon]).addTo(state.map)}
+ }
+ document.getElementById("searchBtn").onclick=searchMap;
+ document.getElementById("mapQuery").onkeydown=e=>{if(e.key==="Enter")searchMap()};
+ document.getElementById("mapQuery").oninput=e=>state.mapQuery=e.target.value;
+ document.getElementById("depart").onchange=e=>{state.depart=e.target.value; if(state.ret<state.depart)state.ret=state.depart; render()};
+ document.getElementById("ret").onchange=e=>state.ret=e.target.value;
+ document.getElementById("budget").oninput=e=>state.budget=Math.max(0,Number(e.target.value)||0);
+ document.querySelectorAll(".preset").forEach(b=>b.onclick=()=>{state.budget=+b.dataset.v;render()});
+ document.getElementById("planBtn").onclick=buildPlan;
+}
+async function handlePin(lat,lon){
+ state.pin={lat,lon}; state.placeName="위치 확인 중…"; render();
+ try{
+  const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&accept-language=ko`);
+  const d=await r.json(),a=d.address||{};
+  state.placeName=[a.city||a.town||a.village||a.county||a.state||"",a.country||""].filter(Boolean).join(", ")||d.display_name||`${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+ }catch{state.placeName=`${lat.toFixed(2)}, ${lon.toFixed(2)}`}
+ render();
+}
+async function searchMap(){
+ if(!state.mapQuery.trim())return;
+ state.searchError="";
+ try{
+  const r=await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(state.mapQuery.trim())}&limit=1&accept-language=ko`);
+  const d=await r.json(); if(!d.length){state.searchError=`"${state.mapQuery}"를 찾지 못했어요.`;render();return}
+  const lat=+d[0].lat,lon=+d[0].lon; await handlePin(lat,lon);
+ }catch{state.searchError="검색에 실패했어요. 잠시 후 다시 시도해주세요.";render()}
+}
+function weatherCondition(code){
+ if([0].includes(code))return"맑음";
+ if([1,2].includes(code))return"구름조금";
+ if([3,45,48].includes(code))return code===3?"흐림":"안개";
+ if([51,53,55,61,63,65,80,81,82].includes(code))return"비";
+ if([71,73,75,77,85,86].includes(code))return"눈";
+ if([95,96,99].includes(code))return"뇌우";
+ return"구름조금";
+}
+async function askWeather(lat,lon,dateList){
+ const start=dateList[0],end=dateList.at(-1);
+ const url=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_min,temperature_2m_max,precipitation_probability_max,weather_code&timezone=auto&start_date=${start}&end_date=${end}`;
+ const r=await fetch(url); if(!r.ok)throw Error("weather");
+ const d=await r.json();
+ return dateList.map((ds,i)=>({d:ds,mn:Math.round(d.daily.temperature_2m_min[i]),mx:Math.round(d.daily.temperature_2m_max[i]),p:d.daily.precipitation_probability_max?.[i]??null,c:weatherCondition(d.daily.weather_code[i])}));
+}
+function buildShoppingList(dayList,totalBudget){
+ const distinct={outer:new Set(),top:new Set(),bottom:new Set(),shoes:new Set()};
+ dayList.forEach(d=>Object.keys(distinct).forEach(k=>{if(d.tier[k]&&d.tier[k]!=="없음")distinct[k].add(d.tier[k])}));
+ const items=[]; Object.keys(distinct).forEach(k=>{const names=[...distinct[k]],cat=totalBudget*({outer:.35,top:.2,bottom:.25,shoes:.2}[k]),per=cat/names.length;names.forEach(name=>items.push({category:CATEGORY_KEY[k],name,budget:per}))});
+ return items.sort((a,b)=>b.budget-a.budget);
+}
+async function buildPlan(){
+ state.error="";state.days=null;state.shoppingList=null;
+ if(!state.pin){state.error="지도에서 여행지를 먼저 찍어주세요.";render();return}
+ const a=new Date(state.depart+"T00:00:00"),b=new Date(state.ret+"T00:00:00"),len=dayDiff(a,b)+1;
+ if(len<1){state.error="입국일은 출국일보다 늦어야 해요.";render();return}
+ if(len>16){state.error="실시간 날씨 API는 최대 16일 정도의 예보를 지원해요. 기간을 줄여주세요.";render();return}
+ state.loading=true;state.status="날씨 확인 중…";render();
+ try{
+  const dates=Array.from({length:len},(_,i)=>iso(addDays(a,i)));
+  const data=await askWeather(state.pin.lat,state.pin.lon,dates);
+  const t0=today();
+  state.days=data.map(d=>{const avg=(d.mn+d.mx)/2,dt=new Date(d.d+"T00:00:00");return{date:dt,mn:d.mn,mx:d.mx,p:d.p,c:d.c,avgTemp:avg,tier:pickTier(avg),estimate:dayDiff(t0,dt)>10}});
+  state.shoppingList=buildShoppingList(state.days,state.budget);
+ }catch(e){state.error="날씨 정보를 가져오지 못했어요. 잠시 후 다시 시도해주세요."}
+ finally{state.loading=false;state.status="";render()}
+}
+render();
+</script>
+</body>
+</html>
