@@ -1,0 +1,566 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import {
+  Sun, Cloud, CloudRain, CloudSnow, CloudFog, CloudLightning,
+  MapPin, Search, Loader2, AlertCircle,
+  ShoppingBag, Wallet, ExternalLink, Plane,
+} from "lucide-react";
+
+/* ────────────────────────────────────────────────────────────────
+   에이클로젯 — 지도에서 목적지를 찍고, 출국~입국 날짜와 예산을 정하면
+   날마다 날씨에 맞는 코디를 추천하고, 필요한 옷을 무신사에서 예산 안에
+   고를 수 있도록 검색 링크를 만들어주는 여행 코디 플래너.
+
+   날씨 데이터: 이 환경에서는 브라우저가 open-meteo 같은 외부 REST API에
+   직접 접속하지 못해 (지도 타일 서비스만 예외) 매번 날씨 조회가 실패했다.
+   대신 Claude API(웹 검색 도구 포함)를 통해 최신 웹 검색 결과를 바탕으로
+   날씨를 요약해서 받아온다 — 사실상 구글 등 웹에 공개된 예보/기후 정보를
+   경유해서 가져오는 방식이다.
+   ──────────────────────────────────────────────────────────────── */
+
+const CONDITION_ICON = {
+  "맑음": Sun, "구름조금": Cloud, "흐림": Cloud, "비": CloudRain,
+  "눈": CloudSnow, "뇌우": CloudLightning, "안개": CloudFog,
+};
+const iconFor = (c) => CONDITION_ICON[c] || Cloud;
+
+// 체감 평균기온(최고/최저 평균) 구간별 코디 규칙
+const OUTFIT_RULES = [
+  { min: 28, outer: "없음", top: "반팔 티셔츠", bottom: "린넨 반바지", shoes: "샌들" },
+  { min: 23, outer: "얇은 셔츠", top: "반팔 · 얇은 셔츠", bottom: "면바지", shoes: "스니커즈" },
+  { min: 20, outer: "가디건", top: "긴팔 셔츠", bottom: "청바지", shoes: "스니커즈" },
+  { min: 17, outer: "자켓", top: "니트", bottom: "청바지", shoes: "스니커즈" },
+  { min: 12, outer: "트렌치코트", top: "기모 맨투맨", bottom: "두꺼운 팬츠", shoes: "부츠" },
+  { min: 9, outer: "울 코트", top: "니트", bottom: "기모 바지", shoes: "부츠" },
+  { min: 5, outer: "두꺼운 코트", top: "기모 후드", bottom: "두꺼운 청바지", shoes: "방한 부츠" },
+  { min: -99, outer: "롱패딩", top: "기모 니트", bottom: "기모 안감 팬츠", shoes: "털 부츠" },
+];
+const pickTier = (avgTemp) => OUTFIT_RULES.find((r) => avgTemp >= r.min) || OUTFIT_RULES.at(-1);
+
+const CATEGORY_WEIGHT = { 아우터: 0.35, 상의: 0.2, 하의: 0.25, 신발: 0.2 };
+const CATEGORY_KEY = { outer: "아우터", top: "상의", bottom: "하의", shoes: "신발" };
+
+const iso = (d) => d.toISOString().slice(0, 10);
+const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+const addDays = (d, n) => { const c = new Date(d); c.setDate(c.getDate() + n); return c; };
+const dayDiff = (a, b) => Math.round((b - a) / 86400000);
+const fmtKo = (d) => `${d.getMonth() + 1}.${d.getDate()} (${"일월화수목금토"[d.getDay()]})`;
+const fmtWon = (n) => `${Math.round(n).toLocaleString("ko-KR")}원`;
+const musinsaLink = (keyword) => `https://www.musinsa.com/search/goods?keyword=${encodeURIComponent(keyword)}`;
+const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+
+const LEAFLET_CSS = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";
+const LEAFLET_JS = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";
+
+// 외부 이미지 파일에 의존하지 않는 인라인 SVG 핀 (깨진 이미지 방지)
+const PIN_SVG = `
+<svg width="30" height="42" viewBox="0 0 30 42" xmlns="http://www.w3.org/2000/svg">
+  <path d="M15 0C6.7 0 0 6.7 0 15c0 10.5 15 27 15 27s15-16.5 15-27C30 6.7 23.3 0 15 0z" fill="#3C5A48"/>
+  <circle cx="15" cy="15" r="6" fill="#FAFAF7"/>
+</svg>`;
+
+export default function AiClosetApp() {
+  const mapDivRef = useRef(null);
+  const mapRef = useRef(null);
+  const markerRef = useRef(null);
+  const [leafletReady, setLeafletReady] = useState(false);
+  const [mapLoadError, setMapLoadError] = useState(false);
+
+  const [pin, setPin] = useState(null); // { lat, lon }
+  const [placeName, setPlaceName] = useState("");
+  const [geoLoading, setGeoLoading] = useState(false);
+
+  const [mapQuery, setMapQuery] = useState("");
+  const [mapSearching, setMapSearching] = useState(false);
+  const [mapSearchError, setMapSearchError] = useState("");
+
+  const [depart, setDepart] = useState(iso(addDays(today(), 5)));
+  const [ret, setRet] = useState(iso(addDays(today(), 8)));
+  const [budget, setBudget] = useState(300000);
+
+  const [days, setDays] = useState(null);
+  const [shoppingList, setShoppingList] = useState(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planStatus, setPlanStatus] = useState("");
+  const [planError, setPlanError] = useState("");
+
+  /* ── Leaflet 지도 초기화 ───────────────────────────────── */
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        if (!document.querySelector(`link[href="${LEAFLET_CSS}"]`)) {
+          const link = document.createElement("link");
+          link.rel = "stylesheet";
+          link.href = LEAFLET_CSS;
+          document.head.appendChild(link);
+        }
+        if (!window.L) {
+          await new Promise((resolve, reject) => {
+            const s = document.createElement("script");
+            s.src = LEAFLET_JS;
+            s.onload = resolve;
+            s.onerror = reject;
+            document.body.appendChild(s);
+          });
+        }
+        if (cancelled || !mapDivRef.current || mapRef.current) return;
+        const L = window.L;
+        const map = L.map(mapDivRef.current, { zoomControl: true }).setView([20, 20], 2);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: "&copy; OpenStreetMap",
+          maxZoom: 18,
+        }).addTo(map);
+        map.on("click", (e) => handlePinDrop(e.latlng.lat, e.latlng.lng));
+        mapRef.current = map;
+        setLeafletReady(true);
+      } catch {
+        if (!cancelled) setMapLoadError(true);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const pinIcon = useCallback(() => {
+    const L = window.L;
+    return L.divIcon({
+      html: PIN_SVG,
+      className: "ac-pin",
+      iconSize: [30, 42],
+      iconAnchor: [15, 42],
+    });
+  }, []);
+
+  const placePin = useCallback((lat, lon) => {
+    const L = window.L;
+    if (!mapRef.current || !L) return;
+    if (markerRef.current) {
+      markerRef.current.setLatLng([lat, lon]);
+    } else {
+      markerRef.current = L.marker([lat, lon], { icon: pinIcon() }).addTo(mapRef.current);
+    }
+  }, [pinIcon]);
+
+  async function handlePinDrop(lat, lon) {
+    setPin({ lat, lon });
+    placePin(lat, lon);
+    setGeoLoading(true);
+    setPlaceName("");
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&accept-language=ko`
+      );
+      const data = await res.json();
+      const a = data.address || {};
+      const city = a.city || a.town || a.village || a.county || a.state || "";
+      const country = a.country || "";
+      setPlaceName([city, country].filter(Boolean).join(", ") || data.display_name || `${lat.toFixed(2)}, ${lon.toFixed(2)}`);
+    } catch {
+      setPlaceName(`${lat.toFixed(2)}, ${lon.toFixed(2)}`);
+    } finally {
+      setGeoLoading(false);
+    }
+  }
+
+  async function searchOnMap() {
+    if (!mapQuery.trim() || !mapRef.current) return;
+    setMapSearching(true);
+    setMapSearchError("");
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(mapQuery.trim())}&limit=1&accept-language=ko`
+      );
+      const data = await res.json();
+      if (!data || data.length === 0) {
+        setMapSearchError(`"${mapQuery}"를 찾지 못했어요. 다른 이름으로 시도해보세요.`);
+        return;
+      }
+      const { lat, lon } = data[0];
+      mapRef.current.setView([+lat, +lon], 10);
+      await handlePinDrop(+lat, +lon);
+    } catch {
+      setMapSearchError("검색에 실패했어요. 잠시 후 다시 시도해주세요.");
+    } finally {
+      setMapSearching(false);
+    }
+  }
+
+  /* ── Claude(웹 검색) 경유로 날씨 조회 ──────────────────────
+     이 화면은 임의의 외부 REST API에 직접 접속할 수 없어서, 대신 이 환경에
+     내장된 Claude API 프록시에 웹 검색 도구를 붙여 날씨를 물어본다.
+     최대한 짧게 답하도록 하고, 트립이 길면 10일 단위로 나눠서 요청한다. */
+  async function askWeather(lat, lon, dateStrs) {
+    const system =
+      "너는 여행 날씨 데이터 도우미야. 웹 검색으로 실제 예보나 그 지역/시기의 평년 기후를 찾아서, " +
+      '아래 JSON 스키마로만 답해. 마크다운 코드블록이나 다른 설명 없이 JSON 한 줄만 출력해: ' +
+      '{"place":"도시, 국가 (한글)","days":[{"d":"YYYY-MM-DD","mn":최저기온(정수,섭씨),"mx":최고기온(정수,섭씨),"p":강수확률(0-100 정수),"c":"맑음|구름조금|흐림|비|눈|뇌우|안개 중 하나"}]}. ' +
+      "예보 범위를 벗어난 먼 미래 날짜는 그 지역 그 시기의 평년 기후로 추정해서 채워.";
+    const userMsg = `위도 ${lat.toFixed(4)}, 경도 ${lon.toFixed(4)} 위치의 날씨를 알려줘. 날짜: ${dateStrs.join(", ")}. 오늘은 ${iso(today())}야.`;
+
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system,
+        messages: [{ role: "user", content: userMsg }],
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+      }),
+    });
+    if (!res.ok) throw new Error("api-error");
+    const data = await res.json();
+    const text = (data.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    const clean = text.replace(/```json|```/g, "").trim();
+    const match = clean.match(/\{[\s\S]*\}/);
+    return JSON.parse(match ? match[0] : clean);
+  }
+
+  async function buildPlan() {
+    setPlanError("");
+    setDays(null);
+    setShoppingList(null);
+
+    if (!pin) { setPlanError("지도에서 여행지를 먼저 찍어주세요."); return; }
+    const dStart = new Date(depart + "T00:00:00");
+    const dEnd = new Date(ret + "T00:00:00");
+    const tripLen = dayDiff(dStart, dEnd) + 1;
+    if (tripLen < 1) { setPlanError("입국일은 출국일보다 늦어야 해요."); return; }
+    if (tripLen > 21) { setPlanError("최대 21일 일정까지 지원돼요. 기간을 줄여주세요."); return; }
+
+    setPlanLoading(true);
+    try {
+      const dateList = Array.from({ length: tripLen }, (_, i) => iso(addDays(dStart, i)));
+      const groups = chunk(dateList, 7);
+
+      let resolvedPlace = "";
+      const merged = {};
+      for (let i = 0; i < groups.length; i++) {
+        setPlanStatus(`날씨 확인 중… (${i + 1}/${groups.length})`);
+        const result = await askWeather(pin.lat, pin.lon, groups[i]);
+        if (result.place && !resolvedPlace) resolvedPlace = result.place;
+        (result.days || []).forEach((d) => { merged[d.d] = d; });
+      }
+      if (resolvedPlace) setPlaceName(resolvedPlace);
+
+      const t0 = today();
+      const withTier = dateList.map((ds) => {
+        const d = merged[ds];
+        const dateObj = new Date(ds + "T00:00:00");
+        if (!d) {
+          // 응답 누락 시 기본값으로 최소한의 결과는 보여준다
+          const avgTemp = 18;
+          return { date: dateObj, mn: 14, mx: 22, p: null, c: "구름조금", avgTemp, tier: pickTier(avgTemp), estimate: true };
+        }
+        const avgTemp = (d.mn + d.mx) / 2;
+        return {
+          date: dateObj, mn: d.mn, mx: d.mx, p: d.p, c: d.c,
+          avgTemp, tier: pickTier(avgTemp),
+          estimate: dayDiff(t0, dateObj) > 10,
+        };
+      });
+
+      setDays(withTier);
+      setShoppingList(buildShoppingList(withTier, budget));
+    } catch (e) {
+      setPlanError("날씨 정보를 가져오지 못했어요. 잠시 후 다시 시도해주세요.");
+    } finally {
+      setPlanLoading(false);
+      setPlanStatus("");
+    }
+  }
+
+  function buildShoppingList(dayList, totalBudget) {
+    const catKeys = ["outer", "top", "bottom", "shoes"];
+    const distinct = { outer: new Set(), top: new Set(), bottom: new Set(), shoes: new Set() };
+    dayList.forEach((d) => {
+      catKeys.forEach((k) => {
+        if (d.tier[k] && d.tier[k] !== "없음") distinct[k].add(d.tier[k]);
+      });
+    });
+    const items = [];
+    catKeys.forEach((k) => {
+      const names = [...distinct[k]];
+      if (names.length === 0) return;
+      const catBudget = totalBudget * CATEGORY_WEIGHT[k];
+      const perItem = catBudget / names.length;
+      names.forEach((name) => items.push({ category: CATEGORY_KEY[k], name, budget: perItem }));
+    });
+    return items.sort((a, b) => b.budget - a.budget);
+  }
+
+  const totalSpend = useMemo(
+    () => (shoppingList ? shoppingList.reduce((s, i) => s + i.budget, 0) : 0),
+    [shoppingList]
+  );
+
+  return (
+    <div style={S.page}>
+      <style>{GLOBAL_CSS}</style>
+
+      <div style={S.wrap}>
+        <header style={S.header}>
+          <div style={S.eyebrow}>AI CLOSET · 여행 코디 플래너</div>
+          <h1 style={S.title}>지도를 찍고, 날짜와 예산을 정하면</h1>
+          <p style={S.subtitle}>출국부터 입국까지, 날마다 입을 옷을 날씨에 맞춰 추천하고 무신사에서 바로 찾아드려요.</p>
+        </header>
+
+        {/* 1. 지도 */}
+        <section style={S.block}>
+          <div style={S.blockHead}>
+            <span style={S.stepNum}>01</span>
+            <span style={S.blockTitle}>여행지 선택</span>
+          </div>
+
+          <div style={S.mapSearchRow}>
+            <div style={S.inputWrap}>
+              <Search size={14} color={C.faint} />
+              <input
+                style={S.input}
+                placeholder="지도에서 찾기 (예: 후쿠오카, Lisbon)"
+                value={mapQuery}
+                onChange={(e) => setMapQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && searchOnMap()}
+              />
+            </div>
+            <button style={S.smallBtn} onClick={searchOnMap} disabled={mapSearching}>
+              {mapSearching ? <Loader2 size={14} className="spin" /> : "이동"}
+            </button>
+          </div>
+          {mapSearchError && <Note icon={<AlertCircle size={13} />} text={mapSearchError} tone="error" />}
+
+          <div ref={mapDivRef} style={S.map}>
+            {!leafletReady && !mapLoadError && (
+              <div style={S.mapLoading}><Loader2 size={20} className="spin" color={C.faint} /></div>
+            )}
+            {mapLoadError && (
+              <div style={S.mapLoading}>
+                <Note icon={<AlertCircle size={13} />} text="지도를 불러오지 못했어요. 아래 검색창에 도시 이름을 입력하고 위/경도를 직접 확인해주세요." tone="error" />
+              </div>
+            )}
+          </div>
+          <p style={S.mapHint}>지도를 클릭하면 그 자리에 핀이 꽂혀요.</p>
+
+          {pin && (
+            <div style={S.pinChip}>
+              <MapPin size={13} color={C.accent} />
+              {geoLoading ? "위치 확인 중…" : placeName}
+            </div>
+          )}
+        </section>
+
+        {/* 2. 일정 & 예산 */}
+        <section style={S.block}>
+          <div style={S.blockHead}>
+            <span style={S.stepNum}>02</span>
+            <span style={S.blockTitle}>일정 · 예산</span>
+          </div>
+
+          <div style={S.row2}>
+            <Field label="출국일">
+              <input type="date" style={S.input} value={depart} min={iso(today())}
+                onChange={(e) => setDepart(e.target.value)} />
+            </Field>
+            <Field label="입국일">
+              <input type="date" style={S.input} value={ret} min={depart}
+                onChange={(e) => setRet(e.target.value)} />
+            </Field>
+          </div>
+
+          <Field label="옷 구매 예산" style={{ marginTop: 16 }}>
+            <div style={S.inputWrap}>
+              <Wallet size={14} color={C.faint} />
+              <input
+                type="number"
+                min={0}
+                step={10000}
+                style={S.input}
+                value={budget}
+                onChange={(e) => setBudget(Math.max(0, Number(e.target.value)))}
+              />
+              <span style={S.wonSuffix}>원</span>
+            </div>
+          </Field>
+          <div style={S.presetRow}>
+            {[100000, 200000, 300000, 500000].map((v) => (
+              <button key={v} style={S.presetBtn(budget === v)} onClick={() => setBudget(v)}>
+                {(v / 10000).toFixed(0)}만
+              </button>
+            ))}
+          </div>
+
+          <button style={S.primaryBtn} onClick={buildPlan} disabled={planLoading}>
+            {planLoading ? <><Loader2 size={15} className="spin" /> {planStatus || "날씨 분석 중…"}</> : "코디 플랜 만들기"}
+          </button>
+          {planError && <Note icon={<AlertCircle size={13} />} text={planError} tone="error" />}
+        </section>
+
+        {/* 3. 결과 */}
+        {days && shoppingList && (
+          <>
+            <section style={S.block}>
+              <div style={S.blockHead}>
+                <span style={S.stepNum}>03</span>
+                <span style={S.blockTitle}>날짜별 코디</span>
+              </div>
+              <div style={S.dayList}>
+                {days.map((d, i) => {
+                  const Icon = iconFor(d.c);
+                  return (
+                    <div key={i} style={S.dayRow}>
+                      <div style={S.dayDate}>
+                        {i === 0 && <Plane size={12} color={C.faint} style={{ marginRight: 4 }} />}
+                        {fmtKo(d.date)}
+                      </div>
+                      <div style={S.dayWeather}>
+                        <Icon size={15} color={C.ink} />
+                        <span style={S.mono}>{Math.round(d.mn)}° / {Math.round(d.mx)}°</span>
+                        {d.estimate && <span style={S.badge}>평년</span>}
+                      </div>
+                      <div style={S.dayOutfit}>
+                        {[d.tier.outer, d.tier.top, d.tier.bottom, d.tier.shoes]
+                          .filter((v) => v && v !== "없음")
+                          .join(" · ")}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <p style={S.disclaimer}>
+                날씨는 웹 검색 결과를 요약한 참고값이에요. 출발 전 최신 예보를 다시 확인해주세요.
+              </p>
+            </section>
+
+            <section style={S.block}>
+              <div style={S.blockHead}>
+                <span style={S.stepNum}>04</span>
+                <span style={S.blockTitle}>쇼핑 리스트</span>
+              </div>
+              <p style={S.shoppingIntro}>
+                여행 기간 동안 겹치는 옷은 한 벌씩만 계산했어요. 예산 {fmtWon(budget)} 중 약 {fmtWon(totalSpend)}을 배분했어요.
+              </p>
+              <div style={S.shopList}>
+                {shoppingList.map((item, i) => (
+                  <a key={i} href={musinsaLink(item.name)} target="_blank" rel="noopener noreferrer" style={S.shopRow}>
+                    <div>
+                      <span style={S.shopCategory}>{item.category}</span>
+                      <div style={S.shopName}>{item.name}</div>
+                    </div>
+                    <div style={S.shopRight}>
+                      <span style={S.mono}>{fmtWon(item.budget)}</span>
+                      <span style={S.shopLink}>
+                        무신사에서 보기 <ExternalLink size={12} />
+                      </span>
+                    </div>
+                  </a>
+                ))}
+              </div>
+              <p style={S.disclaimer}>
+                <ShoppingBag size={12} color={C.faint} /> 표시된 금액은 예산을 항목별로 나눈 참고 값이에요. 실제 상품 가격은 무신사 검색 결과에서 필터로 조정해 확인해주세요.
+              </p>
+            </section>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children, style }) {
+  return (
+    <div style={style}>
+      <label style={S.label}>{label}</label>
+      {children}
+    </div>
+  );
+}
+function Note({ icon, text, tone }) {
+  return (
+    <div style={{ ...S.note, color: tone === "error" ? C.errorText : C.faint }}>
+      {icon}<span>{text}</span>
+    </div>
+  );
+}
+
+/* ── 디자인 토큰 (미니멀) ─────────────────────────────────── */
+const C = {
+  bg: "#FAFAF7",
+  card: "#FFFFFF",
+  border: "#E6E4DC",
+  ink: "#17181A",
+  faint: "#9A9A90",
+  accent: "#3C5A48",
+  accentSoft: "#EEF2ED",
+  errorText: "#B6493D",
+};
+
+const GLOBAL_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+.spin { animation: spin .9s linear infinite; }
+@keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+.leaflet-container { font-family: inherit; }
+.ac-pin { background: transparent; border: none; }
+input:focus { outline: 2px solid ${C.accent}; outline-offset: 1px; }
+input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
+a { text-decoration: none; }
+`;
+
+const S = {
+  page: { minHeight: "100%", background: C.bg, color: C.ink, fontFamily: "'Noto Sans KR', -apple-system, sans-serif", padding: "36px 16px" },
+  wrap: { maxWidth: 640, margin: "0 auto" },
+  header: { marginBottom: 32 },
+  eyebrow: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: "0.08em", color: C.accent, marginBottom: 10 },
+  title: { fontSize: "clamp(22px,4vw,28px)", fontWeight: 700, margin: "0 0 8px", lineHeight: 1.4 },
+  subtitle: { fontSize: 13.5, color: C.faint, margin: 0, lineHeight: 1.6, maxWidth: 480 },
+
+  block: { padding: "26px 0", borderTop: `1px solid ${C.border}` },
+  blockHead: { display: "flex", alignItems: "baseline", gap: 8, marginBottom: 16 },
+  stepNum: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: C.faint },
+  blockTitle: { fontSize: 15, fontWeight: 700 },
+
+  mapSearchRow: { display: "flex", gap: 8, marginBottom: 10 },
+  inputWrap: { display: "flex", alignItems: "center", gap: 8, background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: "9px 12px", flex: 1 },
+  input: { border: "none", outline: "none", background: "transparent", fontSize: 13.5, fontFamily: "inherit", color: C.ink, width: "100%" },
+  wonSuffix: { fontSize: 12.5, color: C.faint, whiteSpace: "nowrap" },
+  smallBtn: { border: `1px solid ${C.border}`, background: C.card, borderRadius: 8, padding: "0 16px", fontSize: 13, cursor: "pointer", color: C.ink },
+
+  map: { width: "100%", height: 300, borderRadius: 10, overflow: "hidden", border: `1px solid ${C.border}`, position: "relative", background: "#EFEEE8" },
+  mapLoading: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, textAlign: "center" },
+  mapHint: { fontSize: 11.5, color: C.faint, marginTop: 8 },
+  pinChip: { marginTop: 10, display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, background: C.accentSoft, color: C.accent, borderRadius: 999, padding: "5px 12px" },
+
+  row2: { display: "flex", gap: 12 },
+  label: { display: "block", fontSize: 11.5, color: C.faint, marginBottom: 6 },
+  presetRow: { display: "flex", gap: 8, marginTop: 8 },
+  presetBtn: (active) => ({
+    border: `1px solid ${active ? C.accent : C.border}`,
+    background: active ? C.accentSoft : C.card,
+    color: active ? C.accent : C.faint,
+    borderRadius: 999, padding: "5px 13px", fontSize: 12, cursor: "pointer",
+  }),
+
+  primaryBtn: { marginTop: 20, width: "100%", background: C.ink, color: "#fff", border: "none", borderRadius: 8, padding: "13px 16px", fontSize: 14, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 },
+
+  note: { display: "flex", alignItems: "flex-start", gap: 6, fontSize: 12.5, marginTop: 10, lineHeight: 1.5 },
+
+  dayList: { display: "flex", flexDirection: "column" },
+  dayRow: { display: "grid", gridTemplateColumns: "78px 92px 1fr", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.border}` },
+  dayDate: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, color: C.ink, display: "flex", alignItems: "center" },
+  dayWeather: { display: "flex", alignItems: "center", gap: 5 },
+  mono: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 12 },
+  badge: { fontSize: 9.5, color: C.faint, border: `1px solid ${C.border}`, borderRadius: 4, padding: "1px 4px" },
+  dayOutfit: { fontSize: 12.5, color: C.ink },
+
+  shoppingIntro: { fontSize: 12.5, color: C.faint, lineHeight: 1.6, marginBottom: 14 },
+  shopList: { display: "flex", flexDirection: "column" },
+  shopRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 0", borderBottom: `1px solid ${C.border}`, cursor: "pointer" },
+  shopCategory: { fontSize: 10.5, color: C.accent, background: C.accentSoft, borderRadius: 4, padding: "2px 6px" },
+  shopName: { fontSize: 14, fontWeight: 500, marginTop: 5, color: C.ink },
+  shopRight: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 },
+  shopLink: { display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, color: C.faint },
+  disclaimer: { display: "flex", alignItems: "flex-start", gap: 6, fontSize: 11, color: C.faint, marginTop: 14, lineHeight: 1.6 },
+};
